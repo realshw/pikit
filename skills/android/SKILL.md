@@ -153,7 +153,7 @@ Whatever a view draws itself — WebViews, canvas/SurfaceView, and many apps'
 custom sheets (Taobao's SKU picker, for one) — exposes **no a11y nodes**, so `ui`
 returns an empty container with no text. When a region comes back empty, fall back
 to a screenshot and read coordinates off it: `./droid shot` writes
-`~/Android/Screenshots/<timestamp>.png` and prints the path (name one with
+`~/Android/Screenshots/shot-<timestamp>.png` and prints the path (name one with
 `./droid shot after-tap`). Keep `ui` for the native chrome (tabs, bars, buttons)
 and reach for pixels only for the custom-drawn interior.
 
@@ -183,8 +183,9 @@ by focus navigation: `./droid key TAB`, then `./droid key ENTER`.
 ## Notes
 
 **Toolchain**
-- `compileSdk`/`targetSdk` 36, `minSdk` 24, Java 17, **Java only**; only
-  `arm64-v8a` matters. No NDK, no native libs, no emulator.
+- `compileSdk`/`targetSdk` 36, `minSdk` 24, Java 17 bytecode (`javac --release
+  17` on the Termux JDK 21), **Java only**; only `arm64-v8a` matters. No NDK, no
+  native libs, no emulator.
 - Android 16 needs Termux `aapt2` 16.0.0.4+ (`pkg upgrade aapt2`).
 - Debug APK is signed with `~/.android/debug.keystore` (created on first build).
 - Root is needed only to install and drive the app, not to build it.
