@@ -51,11 +51,14 @@ the tsconfig.
   - The description carries what the tool does; a `promptSnippet` surfaces it in
     the system prompt’s `<tools>` list. The snippet and the description land in
     separate request regions, so echoing is pi’s convention, not duplication.
+  - A `promptGuidelines` bullet is the tool’s *when*: pi appends it to the system
+    prompt’s rules while the tool is active, so a tool the model should reach for
+    on its own needs one.
   - Keep the description to what its parameters cannot say; it is paid for every
     request.
-- Lead the description with a trigger the agent already performs, not a property
-  it must predict: “before you act” reads as a significant act, so read-only calls
-  slip past; “before any other tool call” catches them.
+- Phrase a trigger as an action the agent already performs, not a property it must
+  predict: “before you act” reads as a significant act, so read-only calls slip
+  past; “before any other tool call” catches them.
 - A caller’s choice belongs in the schema as a required parameter, not as a
   default in the code, so an omission is a schema error rather than a convention.
 - Wrap an MCP server with a few compact tools, never its verbose metadata,
