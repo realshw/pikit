@@ -1,0 +1,5 @@
+node_modules/
+package-lock.json
+
+# Prettier hard-codes `_emphasis_` and has no option for `*`; keep markdown as authored.
+*.md

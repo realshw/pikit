@@ -1,0 +1,113 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# droid — on-device Android helper for the android skill.
+# Wraps the root `su -c` calls; `build` delegates to ./build.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+die() { printf 'droid: %s\n' "$*" >&2; exit 1; }
+# quote a string for the shell that `su -c` spawns
+shq() { local s=${1//\'/\'\\\'\'}; printf "'%s'" "$s"; }
+dev() { su -c "$1"; }
+
+case "${1:-}" in
+build) exec "$HERE/build" "${@:2}" ;;
+# host-side: compile test/ against java/ as sourcepath, then run every test class with a main()
+test)
+	dir=${2:-.}
+	[ -d "$dir/java" ] || die "no java/ directory in $dir"
+	out="$dir/.build/htest"
+	mapfile -t tests < <(find "$dir/test" -name '*.java' 2>/dev/null)
+	[ ${#tests[@]} -gt 0 ] || die "no Java host tests in $dir/test"
+	mkdir -p "$out"
+	# -sourcepath: Android-only sources are compiled only if a test actually reaches them
+	javac -d "$out" -sourcepath "$dir/java" "${tests[@]}" || die "compile failed"
+	classes=("${@:3}")
+	if [ ${#classes[@]} -eq 0 ]; then
+		while IFS= read -r f; do
+			pkg=$(sed -n 's/^package[[:space:]]\+\([A-Za-z0-9_.]*\);.*/\1/p' "$f")
+			pkg=${pkg%%$'\n'*}
+			classes+=("${pkg:+$pkg.}$(basename "$f" .java)")
+		done < <(grep -rl 'static void main' "$dir/test" 2>/dev/null || true)
+	fi
+	[ ${#classes[@]} -gt 0 ] || die "no test class with a main() in $dir/test"
+	rc=0
+	for c in "${classes[@]}"; do
+		printf '%s\n' "$c"
+		java -cp "$out" "$c" || rc=1
+	done
+	exit "$rc"
+	;;
+# copy a built APK to shared storage for the user to install by hand
+ship)
+	apk=${2:?usage: droid ship APK [NAME]}
+	[ -f "$apk" ] || die "no such APK: $apk"
+	dir=$(cd "$(dirname "$apk")" && pwd)
+	name=${3:-$(basename "$dir")}
+	mkdir -p /sdcard/Packages
+	cp "$dir/$(basename "$apk")" "/sdcard/Packages/$name.apk"
+	printf '/sdcard/Packages/%s.apk\n' "$name"
+	;;
+install)
+	dev "pm install -r -d -t -g $(shq "${2:?usage: droid install APK}")"
+	;;
+launch)
+	pkg=${2:?usage: droid launch PACKAGE}
+	comp=$(dev "cmd package resolve-activity --brief $(shq "$pkg")" | tail -1)
+	if [ -n "$comp" ]; then
+		dev "am start -n $(shq "$comp")"
+	else
+		dev "monkey -p $(shq "$pkg") -c android.intent.category.LAUNCHER 1"
+	fi
+	;;
+stop) dev "am force-stop $(shq "${2:?usage: droid stop PACKAGE}")" ;;
+ui)
+	dev "uiautomator dump /data/local/tmp/droid-ui.xml >/dev/null 2>&1; cat /data/local/tmp/droid-ui.xml"
+	;;
+# read the device state before taking it over: app focused+visible+installed, Termux floating
+ready)
+	[ $# -ge 2 ] || die "usage: droid ready PACKAGE"
+	pkg=$2
+	am=$(dev "dumpsys activity activities")
+	pkgs=$(dev "pm list packages")
+	bad=()
+	# match against the captured dump, not a pipe into an early-exiting grep: the
+	# writer can take SIGPIPE, which `pipefail` misreads as failure once it is big
+	focused=$(grep -m1 topDisplayFocusedRootTask <<<"$am" || true)
+	case $focused in *"$pkg"*) ;; *) bad+=("app is not the focused root task") ;; esac
+	pkglines=$(printf '%s\n' "$am" | grep -F "$pkg" || true)
+	case $pkglines in *visible=true*) ;; *) bad+=("app task is not visible") ;; esac
+	installed=$(printf '%s\n' "$pkgs" | grep -xF "package:$pkg" || true)
+	[ -n "$installed" ] || bad+=("$pkg is not installed")
+	termux=$(printf '%s\n' "$am" | grep -A1 -F com.termux || true)
+	case $termux in *hasCaption=true*|*scale=0.*) ;; *) bad+=("Termux is not floating") ;; esac
+	if [ ${#bad[@]} -eq 0 ]; then
+		printf 'READY: %s is focused, visible and installed; Termux is floating\n' "$pkg"
+		exit 0
+	fi
+	printf 'NOT READY:\n'
+	printf '  - %s\n' "${bad[@]}"
+	printf 'Ask the user before sending any input.\n'
+	exit 1
+	;;
+tap) dev "input tap ${2:?usage: droid tap X Y} ${3:?usage: droid tap X Y}" ;;
+swipe) dev "input swipe ${2:?usage: droid swipe X1 Y1 X2 Y2 [MS]} ${3:?} ${4:?} ${5:?} ${6:-300}" ;;
+key) dev "input keyevent ${2:?usage: droid key KEYCODE}" ;;
+text)
+	s=${2:?usage: droid text STRING}
+	dev "input text $(shq "${s// /%s}")"
+	;;
+activity) dev "dumpsys activity $(shq "${2:?usage: droid activity PACKAGE}")" ;;
+crash) dev "dumpsys dropbox --print | tail -n 5000" ;;
+# screenshot into ~/Android/Screenshots; pre-create as the Termux user so root
+# keeps it owned/readable, then print the path
+shot)
+	mkdir -p "$HOME/Android/Screenshots"
+	name=${2:-shot-$(date +%Y%m%d-%H%M%S)}
+	case $name in *.png) ;; *) name=$name.png ;; esac
+	out="$HOME/Android/Screenshots/$name"
+	: > "$out"
+	dev "screencap -p $(shq "$out")"
+	printf '%s\n' "$out"
+	;;
+*) die "usage: droid {build|test|ship|install|launch|stop|ui|ready|tap|swipe|key|text|activity|crash|shot} ..." ;;
+esac

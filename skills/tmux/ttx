@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# ttx — drive named tmux sessions. Helper for the tmux skill.
+set -euo pipefail
+
+die() { printf 'ttx: %s\n' "$*" >&2; exit 1; }
+usage() { die "usage: ttx {spawn|send|type|key|recv|ls|kill|attach} ..."; }
+
+# tmux targets and the Termux intent need a safe, unadorned session name.
+sess() {
+	[[ ${1:-} =~ ^[A-Za-z0-9_-]+$ ]] || die "bad session name: ${1:-}"
+	printf '%s' "$1"
+}
+
+# die unless a session with exactly this name exists (no prefix fallback)
+have() { tmux has-session -t "=$1" 2>/dev/null || die "can't find session: $1"; }
+
+# True when running inside the Termux app (no X/Wayland, but Termux itself is
+# the terminal emulator, so we can open a new tab via an Android intent).
+is_termux() {
+	[[ -n ${TERMUX_VERSION:-}${TERMUX_APP_PID:-} ]] && return 0
+	[[ ${PREFIX:-} == *com.termux* ]] && return 0
+	return 1
+}
+
+# Wait for a client to attach and report it; fail if none arrives.
+confirm_attach() {
+	local name=$1 i clients
+	for ((i = 0; i < 6; i++)); do
+		clients=$(tmux list-clients -t "=$name" -F 'attached: #{client_tty}' 2>/dev/null || true)
+		[ -n "$clients" ] && { printf '%s\n' "$clients"; return 0; }
+		sleep 0.5
+	done
+	die "no client attached to $name"
+}
+
+# Open a new Termux terminal session (tab) that attaches to the tmux session.
+# Starts the private TermuxService directly: same-UID + non-exported component.
+attach_termux() {
+	local name=$1
+	command -v am >/dev/null || die "am not found — cannot open a Termux tab"
+	am startservice -n com.termux/.app.TermuxService \
+		-a com.termux.service_execute \
+		-d "${PREFIX:-/data/data/com.termux/files/usr}/bin/bash" \
+		--esa com.termux.execute.arguments "-lc,exec tmux attach -t =$name" \
+		--es com.termux.execute.working_directory "$HOME" \
+		--es com.termux.execute.runner 'terminal-session' \
+		--es com.termux.execute.session_action '0' >/dev/null || die "could not open a Termux tab"
+	confirm_attach "$name"
+}
+
+# mate-terminal is the daily driver; xterm is the generic fallback.
+emulator() {
+	if command -v mate-terminal >/dev/null; then
+		printf 'mate-terminal\n'
+	elif command -v xterm >/dev/null; then
+		printf 'xterm\n'
+	else
+		return 1
+	fi
+}
+
+case "${1:-}" in
+spawn)
+	[[ $# -ge 2 ]] || usage
+	name=$(sess "$2")
+	shift 2
+	cwd=()
+	if [[ ${1:-} == --cwd ]]; then
+		[[ $# -ge 2 ]] || usage
+		[ -d "$2" ] || die "no such directory: $2"
+		cwd=(-c "$2")
+		shift 2
+	fi
+	tmux new-session -d -s "$name" "${cwd[@]}" "$@"
+	;;
+send)
+	[[ $# -ge 3 ]] || usage
+	name=$(sess "$2")
+	shift 2
+	have "$name"
+	tmux send-keys -t "=$name:" -l "$*"
+	tmux send-keys -t "=$name:" Enter
+	;;
+type)
+	[[ $# -ge 3 ]] || usage
+	name=$(sess "$2")
+	shift 2
+	have "$name"
+	tmux send-keys -t "=$name:" -l "$*"
+	;;
+key)
+	[[ $# -ge 3 ]] || usage
+	name=$(sess "$2")
+	shift 2
+	have "$name"
+	tmux send-keys -t "=$name:" "$@"
+	;;
+recv)
+	[[ $# -ge 2 ]] || usage
+	name=$(sess "$2")
+	lines=${3:-40}
+	[[ $lines =~ ^[0-9]+$ ]] || die "bad line count: $lines"
+	[ "$lines" -gt 0 ] || exit 0
+	have "$name"
+	tmux capture-pane -pt "=$name:" -S - | awk 'NF' | tail -n "$lines"
+	;;
+ls) tmux ls ;;
+kill)
+	[[ $# -ge 2 ]] || usage
+	name=$(sess "$2")
+	have "$name"
+	tmux kill-session -t "=$name"
+	;;
+attach)
+	[[ $# -ge 2 ]] || usage
+	name=$(sess "$2")
+	have "$name"
+	# Desktop first: a display means the user is on a desktop, even inside Termux.
+	if [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]] && emu=$(emulator); then
+		case "$emu" in
+		mate-terminal) setsid mate-terminal --window -t "tty:$name" -e "tmux attach -t =$name" >/dev/null 2>&1 & ;;
+		*) setsid "$emu" -e "tmux attach -t =$name" >/dev/null 2>&1 & ;;
+		esac
+		confirm_attach "$name"
+		exit 0
+	fi
+	# No display, or no usable emulator: fall back to a Termux tab.
+	if is_termux; then
+		attach_termux "$name"
+		exit 0
+	fi
+	die "can't open a terminal — ask the user to run: tmux attach -t $name"
+	;;
+*) usage ;;
+esac

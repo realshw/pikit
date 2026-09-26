@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# icc — inspect a Qualcomm SoC's interconnect fabric. Helper for the qualcomm skill.
+set -euo pipefail
+
+SUMMARY=${ICC_SUMMARY:-/sys/kernel/debug/interconnect/interconnect_summary}
+GRAPH=${ICC_GRAPH:-/sys/kernel/debug/interconnect/interconnect_graph}
+
+die() { printf 'icc: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+	cat >&2 <<'EOF'
+usage:
+  icc top    [-i SEC] [-n N] [-f REGEX] [-s avg|peak]
+  icc read
+  icc clients NODE
+  icc iommu
+  icc raw [summary|graph]
+EOF
+	exit 1
+}
+
+# The kernel summary is root-only; on Android/Termux re-exec through su once.
+# Run the script through $BASH: su drops termux-exec, so the /usr/bin/env
+# shebang would not resolve under the root mount.
+if [ ! -r "$SUMMARY" ] && [ "$(id -u)" != 0 ] && command -v su >/dev/null 2>&1; then
+	exec su -c "$(printf '%q ' "${BASH:-bash}" "$(readlink -f "$0")" "$@")"
+fi
+
+# Mount debugfs when running as root and it is not already there.
+mount_debugfs() {
+	if [ ! -r "$SUMMARY" ] && [ "$(id -u)" = 0 ]; then
+		mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
+	fi
+}
+
+need_summary() {
+	mount_debugfs
+	[ -r "$SUMMARY" ] || die "cannot read $SUMMARY (need root and debugfs mounted)"
+}
+
+# Top-level nodes as "avg<TAB>peak<TAB>name" (kB/s), kernel order. A node line
+# has three fields, an indented client line four (its tag comes second).
+read_parents() {
+	awk '$2 ~ /^[0-9]+$/ && NF == 3 { print $2 "\t" $3 "\t" $1 }' "$SUMMARY"
+}
+
+# Client votes as "parent<TAB>name<TAB>avg<TAB>peak" (kB/s).
+read_clients() {
+	awk '$2 ~ /^[0-9]+$/ {
+		if (NF >= 4) print p "\t" $1 "\t" $3 "\t" $4
+		else p = $1
+	}' "$SUMMARY"
+}
+
+# Format a kB/s vote compactly (no forks — this runs on every refresh).
+fmt() {
+	local n=$1
+	if [ "$n" -ge 1000000 ]; then printf '%d.%02dG' $((n / 1000000)) $(((n % 1000000) / 10000))
+	elif [ "$n" -ge 1000 ]; then printf '%d.%01dM' $((n / 1000)) $(((n % 1000) / 100))
+	else printf '%dk' "$n"
+	fi
+}
+
+# One live frame of the busiest top-level nodes.
+render() {
+	local sortkey=$1 filter=${2:-} rows
+	[ -t 1 ] && printf '\033[H\033[2J'
+	printf 'interconnect  %s   avg/peak bandwidth votes (kB/s)\n\n' "$(date +%H:%M:%S)"
+	printf '%10s %10s  %s\n' avg peak node
+	rows=$(read_parents |
+		if [ -n "$filter" ]; then grep -E -- "$filter" || true; else cat; fi |
+		sort -t"$(printf '\t')" -k"$sortkey","$sortkey"nr |
+		awk -v n="${ICC_TOP_N:-15}" 'NR <= n')
+	if [ -z "$rows" ]; then
+		printf '%10s %10s  %s\n' - - '(idle)'
+		return
+	fi
+	while IFS=$'\t' read -r avg peak name; do
+		printf '%10s %10s  %s\n' "$(fmt "$avg")" "$(fmt "$peak")" "$name"
+	done <<<"$rows"
+}
+
+cmd_top() {
+	local interval=1 count=0 filter='' sortkey=1
+	while getopts ':i:n:f:s:' opt; do
+		case $opt in
+		i) interval=$OPTARG ;;
+		n) count=$OPTARG ;;
+		f) filter=$OPTARG ;;
+		s)
+			sortkey=1
+			if [ "$OPTARG" = peak ]; then sortkey=2; fi
+			;;
+		*) usage ;;
+		esac
+	done
+	need_summary
+	local i=0
+	while :; do
+		render "$sortkey" "$filter"
+		i=$((i + 1))
+		{ [ "$count" -gt 0 ] && [ "$i" -ge "$count" ]; } && break
+		sleep "$interval"
+	done
+}
+
+cmd_read() {
+	need_summary
+	read_parents
+}
+
+cmd_clients() {
+	local node=${1:-}
+	[ -n "$node" ] || usage
+	need_summary
+	read_parents | awk -F'\t' -v n="$node" '$3 == n { found = 1 } END { exit !found }' ||
+		die "no such node: $node"
+	printf '%10s %10s  %s\n' avg peak client
+	read_clients | awk -F'\t' -v n="$node" '$1 == n { print $3 "\t" $4 "\t" $2 }' |
+		sort -t"$(printf '\t')" -k1,1nr |
+		while IFS=$'\t' read -r avg peak name; do
+			printf '%10s %10s  %s\n' "$(fmt "$avg")" "$(fmt "$peak")" "$name"
+		done
+}
+
+cmd_iommu() {
+	[ -d /sys/kernel/iommu_groups ] || die "no IOMMU groups — this kernel exposes no IOMMU"
+	local g d i smmu
+	for g in /sys/kernel/iommu_groups/*; do
+		[ -d "$g/devices" ] || continue
+		for d in "$g"/devices/*; do
+			[ -e "$d/iommu" ] || continue
+			[ -L "$d/iommu" ] || continue
+			i=$(readlink -f "$d/iommu")
+			smmu=$(basename "$(dirname "$(dirname "$i")")")
+			printf '%s\t%s\t%s\t%s\n' "$smmu" "$(basename "$i")" "$(basename "$g")" "$(basename "$d")"
+		done
+	done | sort -t"$(printf '\t')" -k1,1 -k3,3n |
+		awk -F'\t' '
+			$1 != prev { printf "%s  (%s)\n", $1, $2; prev = $1 }
+			{ printf "  group %-4s %s\n", $3, $4 }
+		'
+}
+
+cmd_raw() {
+	case "${1:-summary}" in
+	summary) need_summary; cat "$SUMMARY" ;;
+	graph) mount_debugfs; [ -r "$GRAPH" ] || die "cannot read $GRAPH (need root and debugfs mounted)"; cat "$GRAPH" ;;
+	*) usage ;;
+	esac
+}
+
+case "${1:-}" in
+top) shift; cmd_top "$@" ;;
+read) shift; cmd_read "$@" ;;
+clients) shift; cmd_clients "$@" ;;
+iommu) shift; cmd_iommu "$@" ;;
+raw) shift; cmd_raw "$@" ;;
+*) usage ;;
+esac

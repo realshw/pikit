@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+# ffx — drive the running Firefox over WebDriver. Helper for the firefox skill.
+set -euo pipefail
+
+GD_PORT=${FFX_PORT:-4444}
+MZ_PORT=${FFX_MZ_PORT:-2828}
+BASE="http://127.0.0.1:$GD_PORT"
+STATE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/pi-firefox
+STATE=$STATE_DIR/state
+STRATEGY=$STATE_DIR/strategy
+ELEM_KEY=element-6066-11e4-a52e-4f735466cecf
+
+die() { printf 'ffx: %s\n' "$*" >&2; exit 1; }
+usage() { die "usage: ffx {start|stop|status|strategy|open|search|back|forward|reload|tabs|tab|new|close|title|url|text|html|click|type|key|wait|await|eval|shot} ..."; }
+
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+# wd METHOD PATH [BODY] -> raw WebDriver response; wdv -> its .value (dies on error)
+wd() {
+	local m=$1 p=$2 b=${3:-}
+	local args=(-s -X "$m" "$BASE$p")
+	[ -n "$b" ] && args+=(-H 'Content-Type: application/json' -d "$b")
+	curl "${args[@]}"
+}
+wdv() {
+	local r
+	r=$(wd "$1" "$2" "${3:-}") || die "cannot reach geckodriver on $GD_PORT — Firefox/Session up? try: ffx start"
+	local e
+	e=$(jq -r '.value.error // empty' <<<"$r" 2>/dev/null || true)
+	[ -n "$e" ] && die "$(jq -r '.value.message // "webdriver error"' <<<"$r")"
+	jq -c '.value' <<<"$r"
+}
+
+# like wdv, but reports failure instead of exiting — safe to use in conditions
+wd_ok() {
+	local r
+	r=$(wd "$1" "$2" "${3:-}") || return 1
+	[ -z "$(jq -r '.value.error // empty' <<<"$r" 2>/dev/null)" ]
+}
+
+# pid actually listening on the WebDriver port (empty if unknown)
+gd_pid() {
+	local s
+	s=$(ss -ltnpH "sport = :$GD_PORT" 2>/dev/null || true)
+	grep -o 'pid=[0-9]*' <<<"$s" | sed -n '1p' | cut -d= -f2
+}
+
+state_get() {
+	local v=""
+	if [ -f "$STATE" ]; then
+		v=$(sed -n "s/^$1=//p" "$STATE")
+		v=${v%%$'\n'*}
+	fi
+	printf '%s' "$v"
+}
+
+# Page load strategy is fixed when a WebDriver session is created, so it lives
+# apart from the disposable session state. eager returns at DOMContentLoaded --
+# the DOM is readable while images/scripts still load; none returns before the
+# navigation commits, so reading right after it can still see the old page;
+# normal waits for the full load event (the geckodriver default).
+strategy_get() {
+	local v=""
+	[ -f "$STRATEGY" ] && v=$(head -n1 "$STRATEGY") || true
+	case $v in normal | eager | none) printf '%s' "$v" ;; *) printf 'eager' ;; esac
+}
+strategy_put() {
+	case $1 in normal | eager | none) ;; *) die "unknown page load strategy: $1 (expected normal, eager or none)" ;; esac
+	mkdir -p "$STATE_DIR"
+	printf '%s\n' "$1" >"$STRATEGY"
+}
+
+ff_dir() {
+	if [ -f "$HOME/.config/mozilla/firefox/profiles.ini" ]; then printf '%s' "$HOME/.config/mozilla/firefox"
+	else printf '%s' "$HOME/.mozilla/firefox"; fi
+}
+
+# the profile Firefox is actually using (its `lock` symlink) or profiles.ini's default
+# reads profiles.ini once: the [Install] section's Default names a profile, else the
+# first [Profile] section does; then that profile's Path is resolved against the dir
+default_profile() {
+	local d p; d=$(ff_dir)
+	for p in "$d"/*/; do [ -L "${p}lock" ] && { printf '%s' "${p%/}"; return; }; done
+	local rel
+	rel=$(awk -F= '
+		/^\[/ { sec = ($0 ~ /^\[Profile/) ? "profile" : ($0 ~ /^\[Install/) ? "install" : "other"; name = ""; next }
+		sec == "install" && $1 == "Default" { def = $2 }
+		sec == "profile" && $1 == "Name" { name = $2; if (first == "") first = name }
+		sec == "profile" && $1 == "Path" { path[name] = $2 }
+		END { n = def ? def : first; if (n != "") print (n in path) ? path[n] : n }
+	' "$d/profiles.ini" 2>/dev/null || true)
+	case $rel in /*) printf '%s' "$rel" ;; ?*) printf '%s' "$d/$rel" ;; esac
+}
+
+# pid from the profile lock symlink ("host:+PID")
+running_pid() {
+	local t; t=$(readlink "$1/lock" 2>/dev/null) || return 1
+	[[ $t =~ :\+?([0-9]+)$ ]] || return 1
+	printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# A -marionette launch applies Marionette's recommended automation prefs (this
+# build's greprefs defaults remote.prefs.recommended to true). Those disable the
+# Activity Stream feeds -- blanking the search box and quick dial on about:newtab
+# -- and Firefox persists them, so clear the leftover feed pref and pin the
+# master switch off in the live profile before it launches. focusmanager.testmode
+# is the one that also breaks the browser: it makes Firefox treat itself as
+# focused even in the background, so fcitx/ibus never see a focus change and the
+# input method stops working. Firefox persists it too, so drop it.
+ensure_live_profile() {
+	[ -d "$1" ] || return 0
+	local f=$1/prefs.js
+	touch "$f"
+	sed -i \
+		-e '/^user_pref("browser\.newtabpage\.activity-stream\.testing\.shouldInitializeFeeds",/d' \
+		-e '/^user_pref("remote\.prefs\.recommended/d' \
+		-e '/^user_pref("focusmanager\.testmode",/d' \
+		"$f"
+	printf 'user_pref("remote.prefs.recommended", false);\n' >>"$f"
+}
+
+# ensure Firefox is up with Marionette (restart it with -marionette if not)
+ensure_firefox() {
+	port_open "$MZ_PORT" && return
+	local prof pid
+	prof=$(default_profile || true)
+	pid=""; [ -n "$prof" ] && pid=$(running_pid "$prof" || true)
+	if [ -n "$pid" ]; then
+		printf 'ffx: restarting Firefox (pid %s) with -marionette so it can be driven…\n' "$pid" >&2
+		kill "$pid" 2>/dev/null || true
+		local i
+		for ((i = 0; i < 150; i++)); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+		kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+	else
+		printf 'ffx: starting Firefox with -marionette…\n' >&2
+	fi
+	[ -n "$prof" ] && ensure_live_profile "$prof"
+	setsid firefox -marionette >/dev/null 2>&1 </dev/null &
+	disown 2>/dev/null || true
+	local i
+	for ((i = 0; i < 250; i++)); do port_open "$MZ_PORT" && return; sleep 0.2; done
+	die "Firefox did not open Marionette on port $MZ_PORT"
+}
+
+# ensure a geckodriver on $GD_PORT (reusing a live one) and echo the pid we own
+start_driver() {
+	if port_open "$GD_PORT"; then
+		printf 'ffx: reusing geckodriver on :%s\n' "$GD_PORT" >&2
+		gd_pid
+		return
+	fi
+	setsid geckodriver --connect-existing --marionette-port "$MZ_PORT" --port "$GD_PORT" --log error >/dev/null 2>&1 </dev/null &
+	local p=$!; disown 2>/dev/null || true
+	local i; for ((i = 0; i < 100; i++)); do port_open "$GD_PORT" && break; sleep 0.1; done
+	port_open "$GD_PORT" || die "geckodriver failed to start on port $GD_PORT"
+	printf '%s' "$p"
+}
+
+wait_port_closed() { local i; for ((i = 0; i < 100; i++)); do port_open "$1" || return 0; sleep 0.1; done; }
+
+new_session() {
+	wd POST /session "$(jq -nc --arg s "$(strategy_get)" '{capabilities:{alwaysMatch:{browserName:"firefox",pageLoadStrategy:$s}}}')"
+}
+
+cmd_start() {
+	local s; s=$(state_get session)
+	if [ -n "$s" ] && wd_ok GET "/session/$s/url"; then
+		printf 'ffx: already attached (session %s)\n' "${s:0:8}" >&2
+		return
+	fi
+	rm -f "$STATE" # stale or absent — drop it and (re)attach
+	ensure_firefox
+	local gdpid r sid
+	gdpid=$(start_driver)
+	r=$(new_session) || die "cannot reach geckodriver"
+	if [ -z "$(jq -r '.value.sessionId // empty' <<<"$r")" ] && grep -q 'already started' <<<"$r"; then
+		# our state file was lost but the driver still owns a session — restart it
+		printf 'ffx: orphaned session on the driver — restarting geckodriver\n' >&2
+		kill "$gdpid" 2>/dev/null || true
+		wait_port_closed "$GD_PORT"
+		gdpid=$(start_driver)
+		r=$(new_session) || die "cannot reach geckodriver"
+	fi
+	sid=$(jq -r '.value.sessionId // empty' <<<"$r")
+	[ -n "$sid" ] || die "could not create a session: $(jq -r '.value.message // .' <<<"$r")"
+	mkdir -p "$STATE_DIR"
+	printf 'session=%s\ngdpid=%s\n' "$sid" "$gdpid" >"$STATE"
+	printf 'ffx: attached to Firefox (session %s)\n' "${sid:0:8}" >&2
+}
+
+# any command lazily attaches; validate first so a stale state file self-heals
+sid() {
+	local s; s=$(state_get session)
+	if [ -n "$s" ] && wd_ok GET "/session/$s/url"; then printf '%s' "$s"; return; fi
+	rm -f "$STATE"
+	cmd_start
+	state_get session
+}
+
+# Change the page load strategy; a live session is rebuilt so the change applies.
+cmd_strategy() {
+	local want=${1:-} cur s
+	cur=$(strategy_get)
+	if [ -z "$want" ]; then printf '%s\n' "$cur"; return; fi
+	strategy_put "$want"
+	s=$(state_get session)
+	if [ -n "$s" ] && wd_ok GET "/session/$s/url"; then
+		wd_ok DELETE "/session/$s" || true
+		rm -f "$STATE"
+		sid >/dev/null
+		printf 'ffx: page load strategy: %s (session recreated)\n' "$want" >&2
+	else
+		printf 'ffx: page load strategy: %s\n' "$want" >&2
+	fi
+}
+
+# Find a CSS selector, or return 1 quietly (the caller reports it).
+find_el() {
+	local r
+	r=$(wd POST "/session/$S/element" "$(jq -nc --arg s "$1" '{using:"css selector",value:$s}')") || return 1
+	[ -z "$(jq -r '.value.error // empty' <<<"$r" 2>/dev/null)" ] || return 1
+	jq -r --arg k "$ELEM_KEY" '.value[$k] // empty' <<<"$r"
+}
+
+# Block until a `return`-style JS condition is truthy. The page polls itself via
+# /execute/async, so the whole wait is ONE request instead of a sleep loop.
+await_js() {
+	local ms=${2:-20000} script body r e
+	wdv POST "/session/$S/timeouts" "$(jq -nc --argjson ms "$((ms + 5000))" '{script:$ms}')" >/dev/null
+	script=$(jq -rn --arg js "$1" --argjson ms "$ms" '
+		"const done = arguments[arguments.length-1];\n" +
+		"const end = Date.now() + \($ms);\n" +
+		"(function tick() {\n" +
+		"  let v;\n" +
+		"  try { v = (function () { \($js) })(); } catch (e) { return done({ __ffxError: String(e) }); }\n" +
+		"  if (v) return done(v);\n" +
+		"  if (Date.now() > end) return done(null);\n" +
+		"  setTimeout(tick, 150);\n" +
+		"})();"')
+	body=$(jq -nc --arg s "$script" '{script:$s,args:[]}')
+	r=$(wdv POST "/session/$S/execute/async" "$body")
+	e=$(jq -r '.__ffxError // empty' <<<"$r" 2>/dev/null || true)
+	[ -n "$e" ] && die "page error: $e"
+	printf '%s' "$r"
+}
+
+cmd=${1:-}; [ $# -gt 0 ] && shift || true
+case $cmd in
+"" | help | -h | --help) usage ;;
+start) cmd_start ;;
+stop)
+	s=$(state_get session); g=$(state_get gdpid)
+	if [ -n "$s" ] && ! wd_ok DELETE "/session/$s"; then
+		printf 'ffx: cached session was already gone\n' >&2
+	fi
+	for p in "$(gd_pid)" "$g"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
+	rm -f "$STATE"; printf 'ffx: detached\n' >&2 ;;
+status)
+	s=$(state_get session)
+	if [ -z "$s" ]; then echo detached; exit 0; fi
+	if ! wd_ok GET "/session/$s/url"; then
+		rm -f "$STATE"; echo "detached (stale state cleared)"; exit 0
+	fi
+	printf 'attached  session=%s\nstrategy  %s\nurl       %s\ntitle     %s\ntabs      %s\n' \
+		"${s:0:8}" "$(wdv GET "/session/$s" | jq -r '.capabilities.pageLoadStrategy // "?"')" \
+		"$(wdv GET "/session/$s/url" | jq -r .)" "$(wdv GET "/session/$s/title" | jq -r .)" \
+		"$(wdv GET "/session/$s/window/handles" | jq 'length')" ;;
+strategy) cmd_strategy "${1:-}" ;;
+*)
+	S=$(sid)
+	case $cmd in
+	open) wdv POST "/session/$S/url" "$(jq -nc --arg u "${1:?usage: ffx open URL}" '{url:$u}')" >/dev/null ;;
+	search)
+		# let Firefox run the search itself, so it uses the configured engine
+		q=${1:?usage: ffx search QUERY}
+		before=$(wdv GET "/session/$S/window/handles")
+		setsid firefox --search "$q" >/dev/null 2>&1 </dev/null &
+		disown 2>/dev/null || true
+		h=""
+		for ((i = 0; i < 60; i++)); do
+			sleep 0.25
+			h=$(wdv GET "/session/$S/window/handles" | jq -r --argjson b "$before" '[.[] | select(. as $x | ($b | index($x)) == null)] | .[0] // empty')
+			[ -n "$h" ] && break
+		done
+		[ -n "$h" ] || die "no search tab appeared for: $q"
+		wdv POST "/session/$S/window" "$(jq -nc --arg h "$h" '{handle:$h}')" >/dev/null
+		await_js 'return document.readyState === "complete"' 20000 >/dev/null 2>&1 || true
+		wdv GET "/session/$S/url" | jq -r . ;;
+	back) wdv POST "/session/$S/back" '{}' >/dev/null ;;
+	forward) wdv POST "/session/$S/forward" '{}' >/dev/null ;;
+	reload) wdv POST "/session/$S/refresh" '{}' >/dev/null ;;
+	title) wdv GET "/session/$S/title" | jq -r . ;;
+	url) wdv GET "/session/$S/url" | jq -r . ;;
+	text)
+		if [ -n "${1:-}" ]; then e=$(find_el "$1") || die "no element: $1"; wdv GET "/session/$S/element/$e/text" | jq -r .
+		else wdv POST "/session/$S/execute/sync" '{"script":"return document.body.innerText","args":[]}' | jq -r .; fi ;;
+	html)
+		if [ -n "${1:-}" ]; then e=$(find_el "$1") || die "no element: $1"
+			wdv POST "/session/$S/execute/sync" "$(jq -nc --arg k "$ELEM_KEY" --arg v "$e" '{script:"return arguments[0].outerHTML",args:[{($k):$v}]}')" | jq -r .
+		else wdv POST "/session/$S/execute/sync" '{"script":"return document.documentElement.outerHTML","args":[]}' | jq -r .; fi ;;
+	click) e=$(find_el "${1:?usage: ffx click SEL}") || die "no element: $1"; wdv POST "/session/$S/element/$e/click" '{}' >/dev/null ;;
+	type)
+		sel=${1:?usage: ffx type SEL TEXT}
+		txt=${2:?usage: ffx type SEL TEXT}
+		e=$(find_el "$sel") || die "no element: $sel"
+		wdv POST "/session/$S/element/$e/clear" '{}' >/dev/null
+		# clearing can re-render the node, and some widgets ignore clear() outright
+		e=$(find_el "$sel") || die "no element: $sel"
+		if [ -n "$(wdv GET "/session/$S/element/$e/property/value" | jq -r '. // ""')" ]; then
+			wdv POST "/session/$S/element/$e/click" '{}' >/dev/null
+			wdv POST "/session/$S/actions" '{"actions":[{"type":"key","id":"k","actions":[{"type":"keyDown","value":"\uE009"},{"type":"keyDown","value":"a"},{"type":"keyUp","value":"a"},{"type":"keyUp","value":"\uE009"},{"type":"keyDown","value":"\uE017"},{"type":"keyUp","value":"\uE017"}]}]}' >/dev/null
+			e=$(find_el "$sel") || die "no element: $sel"
+		fi
+		wdv POST "/session/$S/element/$e/value" "$(jq -nc --arg t "$txt" '{text:$t}')" >/dev/null ;;
+	key)
+		e=$(wdv POST "/session/$S/execute/sync" '{"script":"return document.activeElement","args":[]}' | jq -r --arg k "$ELEM_KEY" '.[$k] // empty')
+		[ -n "$e" ] || die "nothing is focused"
+		wdv POST "/session/$S/element/$e/value" "$(jq -nc --arg t "${1:?usage: ffx key TEXT}" '{text:$t}')" >/dev/null ;;
+	eval) wdv POST "/session/$S/execute/sync" "$(jq -nc --arg s "${1:?usage: ffx eval JS}" '{script:$s,args:[]}')" ;;
+	shot)
+		out=${1:-/tmp/ffx-$(date +%s).png}
+		wdv GET "/session/$S/screenshot" | jq -r . | base64 -d >"$out"; printf '%s\n' "$out" ;;
+	wait)
+		sel=${1:?usage: ffx wait SEL [MS]}
+		r=$(await_js "return !!document.querySelector($(jq -n --arg s "$sel" '$s'))" "${2:-20000}")
+		[ "$r" = null ] && die "timeout waiting for $sel"
+		echo found ;;
+	await)
+		r=$(await_js "${1:?usage: ffx await JS [MS]}" "${2:-20000}")
+		[ "$r" = null ] && die "timeout waiting for: $1"
+		printf '%s\n' "$r" ;;
+	tabs)
+		# list every tab, then put focus back where it was
+		cur=$(wdv GET "/session/$S/window" | jq -r .)
+		for h in $(wdv GET "/session/$S/window/handles" | jq -r '.[]'); do
+			wdv POST "/session/$S/window" "$(jq -nc --arg h "$h" '{handle:$h}')" >/dev/null
+			printf '%s\t%s\t%s\n' "$h" "$(wdv GET "/session/$S/title" | jq -r .)" "$(wdv GET "/session/$S/url" | jq -r .)"
+		done
+		wdv POST "/session/$S/window" "$(jq -nc --arg h "$cur" '{handle:$h}')" >/dev/null ;;
+	tab)
+		arg=${1:?usage: ffx tab INDEX|HANDLE}
+		if [[ $arg =~ ^[0-9]+$ ]]; then h=$(wdv GET "/session/$S/window/handles" | jq -r --argjson i "$arg" '.[$i]'); else h=$arg; fi
+		[ -n "$h" ] && [ "$h" != null ] || die "no such tab: $arg"
+		wdv POST "/session/$S/window" "$(jq -nc --arg h "$h" '{handle:$h}')" >/dev/null ;;
+	new)
+		h=$(wdv POST "/session/$S/window/new" '{"type":"tab"}' | jq -r .handle)
+		wdv POST "/session/$S/window" "$(jq -nc --arg h "$h" '{handle:$h}')" >/dev/null
+		[ -n "${1:-}" ] && wdv POST "/session/$S/url" "$(jq -nc --arg u "$1" '{url:$u}')" >/dev/null
+		printf '%s\n' "$h" ;;
+	close)
+		n=$(wdv GET "/session/$S/window/handles" | jq 'length')
+		[ "$n" -gt 1 ] || die "refusing to close the last tab — that would close the browser"
+		wdv DELETE "/session/$S/window" >/dev/null
+		h=$(wdv GET "/session/$S/window/handles" | jq -r '.[0] // empty')
+		[ -n "$h" ] && wd_ok POST "/session/$S/window" "$(jq -nc --arg h "$h" '{handle:$h}')" || true ;;
+	*) usage ;;
+	esac ;;
+esac

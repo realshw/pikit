@@ -1,0 +1,112 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Build and sign an APK on aarch64 Termux with the Termux toolchain:
+# aapt2 compile -> link -> javac -> d8 -> zip -> apksigner.
+# usage: build PROJECT_DIR [out.apk]
+set -euo pipefail
+
+PROJ="${1:-}"
+[ -n "$PROJ" ] || { echo "build: usage: build PROJECT_DIR [out.apk]" >&2; exit 2; }
+PROJ="$(cd "$PROJ" && pwd)"
+
+API=36 MIN=24
+SDK="$HOME/Android/SDK"
+JAR="$SDK/platforms/android-$API/android.jar"
+CACHE="$HOME/.cache/pi-android"
+PLATFORM="platform-36_r02.zip"
+PLATFORM_SHA="37607369a28c5b640b3a7998868d45898ebcb777565a0e85f9acf36f29631d2e"
+MIRROR="https://mirrors.cloud.tencent.com/AndroidSDK"
+UPSTREAM="https://dl.google.com/android/repository"
+
+log() { printf '\033[1;34m[build]\033[0m %s\n' "$*"; }
+need() { command -v "$1" >/dev/null 2>&1; }
+
+# 0. toolchain: Termux packages + the full platform android.jar (no root)
+want=()
+need java      || want+=(openjdk-21)
+need aapt2     || want+=(aapt2)
+need d8        || want+=(d8)
+need apksigner || want+=(apksigner)
+need curl      || want+=(curl)
+need unzip     || want+=(unzip)
+need zip       || want+=(zip)
+if [ "${#want[@]}" -gt 0 ]; then
+	log "installing: ${want[*]}"
+	export DEBIAN_FRONTEND=noninteractive
+	pkg install -y "${want[@]}" >/dev/null 2>&1 || {
+		pkg update -y >/dev/null 2>&1 || true
+		pkg install -y "${want[@]}" >/dev/null
+	}
+fi
+
+if [ ! -f "$JAR" ]; then
+	mkdir -p "$CACHE"
+	z="$CACHE/$PLATFORM"
+	if ! { [ -f "$z" ] && printf '%s  %s\n' "$PLATFORM_SHA" "$z" | sha256sum -c - >/dev/null 2>&1; }; then
+		# China mirror first, Google upstream as fallback; keep only a verified file
+		rm -f "$z"
+		for url in "$MIRROR/$PLATFORM" "$UPSTREAM/$PLATFORM"; do
+			log "fetching $PLATFORM <- $url"
+			if curl -fL --retry 3 -o "$z.part" "$url" \
+			   && printf '%s  %s\n' "$PLATFORM_SHA" "$z.part" | sha256sum -c - >/dev/null 2>&1; then
+				mv "$z.part" "$z"; break
+			fi
+			rm -f "$z.part"
+		done
+		[ -f "$z" ] || { echo "build: download failed for $PLATFORM" >&2; exit 1; }
+	fi
+	stage="$SDK/.stage"
+	rm -rf "$stage"; mkdir -p "$stage"
+	unzip -q -o "$z" -d "$stage"
+	src="$(find "$stage" -maxdepth 1 -mindepth 1 -type d -print -quit)"
+	rm -rf "$SDK/platforms/android-$API"; mkdir -p "$SDK/platforms"
+	mv "$src" "$SDK/platforms/android-$API"; rm -rf "$stage"
+fi
+
+OUT="${2:-app.apk}"
+[ "${OUT#/}" = "$OUT" ] && OUT="$PROJ/$OUT"
+B="$PROJ/.build"
+rm -rf "$B"; mkdir -p "$B/res" "$B/gen" "$B/classes" "$B/dex"
+
+# 1. resources -> compiled zip
+res=()
+[ -d "$PROJ/res" ] && { aapt2 compile --dir "$PROJ/res" -o "$B/res.zip"; res=("$B/res.zip"); }
+
+# 2. link resources + manifest -> base.apk, emit R.java
+link=(aapt2 link -o "$B/base.apk" -I "$JAR" --manifest "$PROJ/AndroidManifest.xml"
+	  --java "$B/gen" --min-sdk-version "$MIN" --target-sdk-version "$API")
+[ -d "$PROJ/assets" ] && link+=(-A "$PROJ/assets")
+link+=("${res[@]}")
+"${link[@]}"
+
+# 3. javac -> classes
+cp="$JAR"
+for j in "$PROJ"/libs/*.jar; do [ -e "$j" ] && cp="$cp:$j"; done
+sources="$(find "$PROJ/java" "$B/gen" -name '*.java' 2>/dev/null || true)"
+[ -n "$sources" ] || { echo "build: no .java sources found" >&2; exit 1; }
+# shellcheck disable=SC2086
+javac --release 17 -classpath "$cp" -d "$B/classes" $sources
+
+# 4. d8 -> dex
+# shellcheck disable=SC2046
+d8 --release --min-api "$MIN" --lib "$JAR" --output "$B/dex" $(find "$B/classes" -name '*.class')
+
+# 5. fold classes*.dex into the APK
+cp "$B/base.apk" "$B/unsigned.apk"
+for d in "$B"/dex/*.dex; do
+	(cd "$B/dex" && zip -q -X "$B/unsigned.apk" "$(basename "$d")")
+done
+
+# 6. sign (aapt2 already aligns resources.arsc)
+KS="$HOME/.android/debug.keystore"
+if [ ! -f "$KS" ]; then
+	mkdir -p "$(dirname "$KS")"
+	keytool -genkeypair -keystore "$KS" -storepass android -keypass android \
+		-alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+		-dname "CN=Android Debug,O=Android,C=US" >/dev/null
+fi
+apksigner sign --ks "$KS" --ks-pass pass:android --key-pass pass:android \
+	--ks-key-alias androiddebugkey --out "$OUT" "$B/unsigned.apk"
+apksigner verify "$OUT"
+
+rm -rf "$B"
+log "APK: $OUT"

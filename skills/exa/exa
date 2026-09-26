@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# exa — web search and page fetch over Exa's MCP endpoint. Helper for the exa skill.
+set -euo pipefail
+
+ENDPOINT=${EXA_MCP_URL:-https://mcp.exa.ai/mcp}
+DEFAULT_FETCH_CHARS=${EXA_FETCH_CHARS:-3000}
+INLINE_CHARS=${EXA_INLINE_CHARS:-2000}
+OUT_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/pi-exa
+
+die() { printf 'exa: %s\n' "$*" >&2; exit 1; }
+
+# Reject a non-numeric count here, or jq reports it instead of us.
+is_num() { case $1 in '' | *[!0-9]*) return 1 ;; esac; }
+
+usage() {
+	cat >&2 <<'EOF'
+usage:
+  exa search QUERY [--objective BRIEF] [--num N]
+  exa fetch URL... [--chars N]
+  exa raw TOOL JSON
+EOF
+	exit 1
+}
+
+# The API key rides in the query string; without it the free tier rate-limits.
+endpoint() {
+	if [ -n "${EXA_API_KEY:-}" ]; then
+		printf '%s?exaApiKey=%s' "$ENDPOINT" "$(jq -rn --arg key "$EXA_API_KEY" '$key|@uri')"
+	else
+		printf '%s' "$ENDPOINT"
+	fi
+}
+
+# Call one MCP tool and print the JSON-RPC result object. MCP answers either
+# plain JSON or an SSE stream; we take the JSON payload from whichever arrives.
+call() {
+	local tool=$1 args=$2 body resp json err res
+	body=$(jq -nc --arg tool "$tool" --argjson args "$args" \
+		'{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:$tool,arguments:$args}}')
+	# -f: a non-2xx status is a failure, not a body to parse as a result.
+	resp=$(curl -fsS -X POST "$(endpoint)" \
+		-H 'content-type: application/json' \
+		-H 'accept: application/json, text/event-stream' \
+		-H 'mcp-protocol-version: 2025-11-25' \
+		--data "$body") || die "request to $ENDPOINT failed"
+	json=$(jq -c '.' <<<"$resp" 2>/dev/null || true)
+	if [ -z "$json" ]; then
+		json=$(awk '/^data:/{sub(/^data: */,""); print; exit}' <<<"$resp")
+	fi
+	jq -e . >/dev/null 2>&1 <<<"$json" || die "unreadable response from $ENDPOINT"
+	err=$(jq -r '.error.message? // empty' <<<"$json")
+	[ -n "$err" ] && die "$err"
+	res=$(jq -c '.result' <<<"$json")
+	# A tool-level failure is still a failure, so report it rather than print it as data.
+	if [ "$(jq -r '.isError? // false' <<<"$res")" = true ]; then
+		die "$(jq -r '[.content[]?.text // empty] | join("\n")' <<<"$res")"
+	fi
+	printf '%s\n' "$res"
+}
+
+# Call a tool and print its content blocks joined as text.
+call_text() {
+	call "$1" "$2" | jq -r '[.content[]?.text // empty] | join("\n")'
+}
+
+cmd_search() {
+	local query='' objective='' num=''
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--objective)
+			[ $# -ge 2 ] || die "--objective needs a value"
+			objective=$2
+			shift 2
+			;;
+		--num)
+			[ $# -ge 2 ] || die "--num needs a value"
+			num=$2
+			shift 2
+			;;
+		--help | -h) usage ;;
+		-*) die "unknown search option: $1" ;;
+		*)
+			[ -z "$query" ] || die "search takes one query"
+			query=$1
+			shift
+			;;
+		esac
+	done
+	[ -n "$query" ] || usage
+	[ -n "$objective" ] || objective=$query
+	[ -z "$num" ] || is_num "$num" || die "--num needs a number"
+	local args
+	args=$(jq -nc --arg query "$query" --arg objective "$objective" --arg num "$num" \
+		'{query:$query, objective:$objective} + (if $num == "" then {} else {numResults:($num|tonumber)} end)')
+	call_text web_search_exa "$args"
+}
+
+cmd_fetch() {
+	local chars=$DEFAULT_FETCH_CHARS urls=()
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--chars)
+			[ $# -ge 2 ] || die "--chars needs a value"
+			chars=$2
+			shift 2
+			;;
+		--help | -h) usage ;;
+		-*) die "unknown fetch option: $1" ;;
+		*)
+			urls+=("$1")
+			shift
+			;;
+		esac
+	done
+	[ ${#urls[@]} -gt 0 ] || usage
+	is_num "$chars" || die "--chars needs a number"
+	local args text total cut path
+	args=$(jq -nc --argjson chars "$chars" --args '{urls:$ARGS.positional, maxCharacters:$chars}' "${urls[@]}")
+	text=$(call_text web_fetch_exa "$args")
+	total=${#text}
+	cut=''
+	# Exa itself cuts the page at `chars`; say so rather than let it look complete.
+	[ "$total" -ge "$chars" ] && cut="Exa cut the page at $chars characters; raise --chars for more"
+	if [ "$total" -le "$INLINE_CHARS" ]; then
+		printf '%s\n' "$text"
+		[ -n "$cut" ] && printf '[%s]\n' "$cut"
+		return 0
+	fi
+	mkdir -p "$OUT_DIR"
+	path=$(mktemp "$OUT_DIR/fetch.XXXXXX.md")
+	printf '%s\n' "$text" >"$path"
+	printf '%s\n\n[%d characters total; full text at %s]' "${text:0:$INLINE_CHARS}" "$total" "$path"
+	[ -n "$cut" ] && printf ' [%s]' "$cut"
+	printf '\n'
+}
+
+cmd_raw() {
+	[ $# -eq 2 ] || usage
+	jq -e 'true' <<<"$2" >/dev/null 2>&1 || die "raw JSON is not valid JSON"
+	call "$1" "$2" | jq .
+}
+
+[ $# -ge 1 ] || usage
+cmd=$1
+shift
+case "$cmd" in
+search) cmd_search "$@" ;;
+fetch) cmd_fetch "$@" ;;
+raw) cmd_raw "$@" ;;
+*) usage ;;
+esac
