@@ -46,17 +46,16 @@ the tsconfig.
 ## Tools
 
 - Name a tool in one word, and put each rule where it acts:
-  - The input shape goes in the parameter description, a lesson in
-    `promptGuidelines`, a hard limit in tool validation — never restated in prose.
-  - The description carries the what and a trigger-led `promptGuidelines` the when;
-    a `promptSnippet` surfaces it. The snippet lands in the system prompt’s
-    `<tools>` list, the description in the provider’s tool JSON — separate request
-    regions, so echoing is pi’s convention, not duplication.
-  - Keep the guideline a ~50-character trigger and the description to what its
-    parameters cannot say; both are paid for every request.
-- Name the prompt trigger after an action the agent already performs, not a
-  property it must predict: “before you act” reads as a significant act, so
-  read-only calls slip past; “before any other tool call” catches them.
+  - The input shape goes in the parameter description, a hard limit in tool
+    validation — never restated in prose.
+  - The description carries what the tool does; a `promptSnippet` surfaces it in
+    the system prompt’s `<tools>` list. The snippet and the description land in
+    separate request regions, so echoing is pi’s convention, not duplication.
+  - Keep the description to what its parameters cannot say; it is paid for every
+    request.
+- Lead the description with a trigger the agent already performs, not a property
+  it must predict: “before you act” reads as a significant act, so read-only calls
+  slip past; “before any other tool call” catches them.
 - A caller’s choice belongs in the schema as a required parameter, not as a
   default in the code, so an omission is a schema error rather than a convention.
 - Wrap an MCP server with a few compact tools, never its verbose metadata,
