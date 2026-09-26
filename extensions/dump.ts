@@ -43,7 +43,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "dump",
     label: "Dump Prompt",
-    description: "Dump the live system prompt and tool definitions to a tmp file",
+    description: "Dump the live system prompt and tool definitions to a tmp file and report its path; read that file for the content",
     promptSnippet: "Dump the live system prompt and tool definitions to a tmp file",
     promptGuidelines: ["Use dump to see the live system prompt and tool definitions rather than guessing."],
     parameters: Type.Object({}),
