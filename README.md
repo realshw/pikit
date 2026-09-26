@@ -44,9 +44,8 @@ Use `pi config` to enable or disable individual extensions and skills.
   tree at `<agent-dir>/memory`. See
   [`skills/memory/SKILL.md`](skills/memory/SKILL.md).
 - **pikit** — extend pi itself: choose between a pi extension and a skill + CLI,
-  hook pi's runtime (lifecycle hooks, tool rendering, the mutation queue,
-  system-prompt sections), and keep tools and prompt sections lean. The
-  guidelines live in pikit. See
+  hook pi's runtime (tool rendering, system-prompt sections), and keep tools and
+  prompt sections lean. The guidelines live in pikit. See
   [`skills/pikit/SKILL.md`](skills/pikit/SKILL.md).
 - **qualcomm** — inspect a Qualcomm SoC at runtime with `icc`: live per-node
   interconnect bandwidth votes, client drill-down, and the SMMU/IOMMU map. See
