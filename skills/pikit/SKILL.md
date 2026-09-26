@@ -54,9 +54,9 @@ the tsconfig.
   - A `promptGuidelines` bullet is the tool’s *when*: pi appends it to the system
     prompt’s rules while the tool is active, so a tool the model should reach for
     on its own needs one.
-  - Keep every model-facing string short — description, snippet, guideline,
-    parameter description — to what the model cannot infer; each is paid for on
-    every request.
+- Keep a tool’s model-facing text short — its description, parameter
+  descriptions, `promptSnippet` and `promptGuidelines` — and carry only what the
+  model cannot infer; each is paid for on every request.
 - Phrase a trigger as an action the agent already performs, not a property it must
   predict: “before you act” reads as a significant act, so read-only calls slip
   past; “before any other tool call” catches them.
