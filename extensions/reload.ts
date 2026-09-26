@@ -52,7 +52,7 @@ export default function (pi: ExtensionAPI) {
     label: "Reload Runtime",
     description: "Reload the agent runtime",
     promptSnippet: "Reload the agent runtime",
-    promptGuidelines: ["After editing any pi extension, skill, prompt, theme or context file, call reload so the change takes effect and the turn resumes."],
+    promptGuidelines: ["Call reload after editing a pi extension, skill or prompt."],
     parameters: Type.Object({}),
     // The reload is a state change, not an event: it earns no transcript row.
     renderShell: "self",
