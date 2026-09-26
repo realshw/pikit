@@ -1,6 +1,6 @@
 ---
 name: pikit
-description: Extend pi — choose between a pi extension and a skill + CLI, hook pi’s runtime (lifecycle hooks, tool rendering, the mutation queue, system-prompt sections), and keep tools and prompt sections lean. Follows the pikit repository conventions. Use when adding or editing a pi extension, skill or CLI, or when deciding how a new pi capability should ship.
+description: Extend pi — choose between a pi extension and a skill + CLI, hook pi’s runtime (tool rendering, system-prompt sections), and keep tools and prompt sections lean. Follows the pikit repository conventions. Use when adding or editing a pi extension, skill or CLI, or when deciding how a new pi capability should ship.
 ---
 
 # Extending pi
@@ -10,10 +10,8 @@ to hook pi’s runtime, and how to keep tools and prompt sections lean. They liv
 in pikit, the monorepo that bundles our extensions and skills, so its repository
 conventions below are the concrete home: extensions are single files under
 `extensions/`; skills are `skills/<name>/SKILL.md` with an extensionless CLI
-beside them when the work is shell-drivable. Pi loads each skill’s name,
-description and location at startup, and its body on demand — so a body edit
-takes effect at once, while a name or description edit waits for a reload. A
-clean `npm run check` is required, and work lands on `master`.
+beside them when the work is shell-drivable. A clean `npm run check` is required,
+and work lands on `master`.
 
 ## Ship an extension, or a skill + CLI?
 
@@ -40,20 +38,10 @@ the CLI does not cover.
 
 ## Extensions
 
-An extension’s entrypoint is an anonymous default export — `export default
-function (pi: ExtensionAPI)` — since `default` already names it. Namespace shared
-`globalThis` state per extension.
-
-Helpers can live in a subdirectory: pi loads one only when it carries an
-`index.ts`, so a plain subdir is skipped, and a `.ts` import specifier needs
-`allowImportingTsExtensions` in the tsconfig.
-
-Keep the factory free of processes, sockets, watchers and timers: some loads
-never start a session.
-- Start a long-lived resource from `session_start`, and release it in an
-  idempotent `session_shutdown`.
-- A reload replaces the runtime, so code after `await ctx.reload()` must not
-  reuse old-runtime state.
+Export an anonymous default factory — `default` already names it. Namespace
+shared `globalThis` state per extension. A helper lives in a subdirectory with
+an `index.ts`; a `.ts` import specifier needs `allowImportingTsExtensions` in
+the tsconfig.
 
 ## Tools
 
@@ -71,8 +59,6 @@ never start a session.
   read-only calls slip past; “before any other tool call” catches them.
 - A caller’s choice belongs in the schema as a required parameter, not as a
   default in the code, so an omission is a schema error rather than a convention.
-- A long tool result goes to a file whose path is returned, the way pi’s bash
-  truncation does: the inline part is capped, and nothing is dropped silently.
 - Wrap an MCP server with a few compact tools, never its verbose metadata,
   keeping its provider prefix.
 - Use pi’s own nouns in what a tool declares: system prompt and tool definitions,
@@ -82,9 +68,6 @@ never start a session.
     for the state, and the line it sets is its whole surface.
   - Agent state belongs in that line (`setWorkingMessage`), not a widget, which
     persists past the run and competes with the live line.
-- A tool that reads and rewrites a file goes through pi’s per-file mutation queue;
-  sibling tool calls run in parallel by default, so a bare read-modify-write loses
-  an update.
 - A tool that must not overlap its siblings sets `executionMode: "sequential"`;
   one sequential call runs the whole batch one at a time.
 - Override a built-in tool only when a sentence beats the row it already shows;
@@ -168,9 +151,8 @@ surface costs.
   it only on a full UI reset — so derive the line on `agent_start`: it fires on
   every run path, before the working row, and needs no settle handler. Deriving it
   on `before_agent_start` misses runs that skip `prompt()`.
-- `ctx.reload()` runs only from a command handler — a tool cannot call it — so a
-  tool stages the request and an `agent_settled` handler dispatches the command
-  once the turn ends.
+- A tool cannot call `ctx.reload()`, so it stages the request and an
+  `agent_settled` handler dispatches the command once the turn ends.
 - `sendMessage` with `triggerTurn` runs the agent directly, skipping
   `before_agent_start`, so a resume sent that way skips every prompt-section
   re-injection for that turn.
