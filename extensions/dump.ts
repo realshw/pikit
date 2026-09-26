@@ -45,6 +45,7 @@ export default function (pi: ExtensionAPI) {
     label: "Dump Prompt",
     description: "Dump the live system prompt and tool definitions to a tmp file",
     promptSnippet: "Dump the live system prompt and tool definitions to a tmp file",
+    promptGuidelines: ["Use dump to see the live system prompt and tool definitions rather than guessing."],
     parameters: Type.Object({}),
     // The custom message is the dump's only transcript row; the tool row stays empty.
     renderShell: "self",
