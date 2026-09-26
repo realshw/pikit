@@ -12,7 +12,7 @@ Use `pi config` to enable or disable individual extensions and skills.
 
 ## Extensions
 
-- **bash** — the built-in `bash` tool with a required `summary` paragraph. Collapsed,
+- **bash** — the built-in `bash` tool with a required `brief` paragraph. Collapsed,
   the transcript shows the paragraph and hides the result; expanded, it shows the
   raw command and output as usual.
 - **dump** — a `dump` tool that writes the live system prompt and every tool
