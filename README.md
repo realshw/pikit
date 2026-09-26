@@ -50,7 +50,7 @@ Use `pi config` to enable or disable individual extensions and skills.
 - **qualcomm** — inspect a Qualcomm SoC at runtime with `icc`: live per-node
   interconnect bandwidth votes, client drill-down, and the SMMU/IOMMU map. See
   [`skills/qualcomm/SKILL.md`](skills/qualcomm/SKILL.md).
-- **tmux** — drive named tmux sessions from the `bash` tool (spawn detached,
+- **tmux** — drive named tmux sessions with the `ttx` helper (spawn detached,
   type, read, kill) and open a visible terminal attached to one. See
   [`skills/tmux/SKILL.md`](skills/tmux/SKILL.md).
 
